@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
@@ -24,25 +25,32 @@ import (
 var (
 	// Version is set during release
 	Version          = "dev"
-	APIURL           = "https://usewebhook.com/api/webhooks/"
-	BaseURL          = "https://usewebhook.com"
+	APIURL           = "http://localhost:8911/api/"
+	BaseURL          = "http://localhost:8911"
 	SettingsFilename = ".usewebhook"
 )
 
 // WebhookRequest represents a single webhook request
 type WebhookRequest struct {
-	RequestID string            `json:"request_id"`
-	Timestamp string            `json:"timestamp"`
-	IP        string            `json:"ip"`
-	Method    string            `json:"method"`
-	Query     string            `json:"query"`
-	Headers   map[string]string `json:"headers"`
-	Body      string            `json:"body"`
+	RequestID string `json:"id"`
+	Request   RawRequest
+	Raw       json.RawMessage `json:"req"`
+	Body      string          `json:"body"`
+}
+
+type RawRequest struct {
+	Method  string            `json:"method"`
+	URL     string            `json:"url"`
+	Headers map[string]string `json:"headers"`
+	Query   map[string]string `json:"query"`
+	Params  map[string]string `json:"params"`
+	Body    map[string]string `json:"body"`
+	IP      string            `json:"ip"`
 }
 
 // WebhookResponse represents the response from the webhook API
 type WebhookResponse struct {
-	Requests []WebhookRequest `json:"requests"`
+	Requests []WebhookRequest `json:"data"`
 }
 
 // Config represents the user's configuration
@@ -63,7 +71,7 @@ type AppConfig struct {
 
 // fetchWebhookData retrieves webhook data from the API
 func fetchWebhookData(webhookID string, params url.Values) (*WebhookResponse, error) {
-	requestURL := APIURL + webhookID
+	requestURL := APIURL + "webhook/requests/" + webhookID
 	if len(params) > 0 {
 		requestURL += "?" + params.Encode()
 	}
@@ -75,12 +83,31 @@ func fetchWebhookData(webhookID string, params url.Values) (*WebhookResponse, er
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unable to fetch webhook data (status code %d)", resp.StatusCode)
+		return nil, fmt.Errorf("unable to fetch webhook data (status code %d)", resp)
 	}
 
 	var webhookResp WebhookResponse
 	if err := json.NewDecoder(resp.Body).Decode(&webhookResp); err != nil {
 		return nil, err
+	}
+	for index, item := range webhookResp.Requests {
+
+		var jsonStr string
+		if err := json.Unmarshal(item.Raw, &jsonStr); err != nil {
+			return nil, err
+		}
+
+		var req RawRequest
+		if err = json.Unmarshal([]byte(jsonStr), &req); err != nil {
+			color.Green("ERROR HERE 2")
+			return nil, err
+		}
+
+		var webhookData WebhookRequest
+		webhookData.Request = req
+		webhookData.RequestID = item.RequestID
+		// webhookData.Body = item.Body
+		webhookResp.Requests[index] = webhookData
 	}
 
 	return &webhookResp, nil
@@ -106,19 +133,17 @@ func getValueOrEmpty(value interface{}) string {
 func logRequest(request WebhookRequest, fullLog bool) {
 	if fullLog {
 		color.Yellow("\n=== Start of Request ID: %s ===\n", request.RequestID)
-		color.Cyan("Timestamp: %s", color.HiBlackString(request.Timestamp))
-		color.Cyan("Source IP (anonymized): %s", color.HiBlackString(getValueOrEmpty(request.IP)))
-		color.Cyan("Method: %s", color.HiBlackString(getValueOrEmpty(request.Method)))
-		color.Cyan("Query: %s", color.HiBlackString(getValueOrEmpty(request.Query)))
-		color.Cyan("Headers: %s", color.HiBlackString(getValueOrEmpty(prettyJSON(request.Headers))))
+		color.Cyan("Source IP (anonymized): %s", color.HiBlackString(getValueOrEmpty(request.Request.IP)))
+		color.Cyan("Method: %s", color.HiBlackString(getValueOrEmpty(request.Request.Method)))
+		color.Cyan("Query: %s", color.HiBlackString(getValueOrEmpty(request.Request.Query)))
+		color.Cyan("Headers: %s", color.HiBlackString(getValueOrEmpty(prettyJSON(request.Request.Headers))))
 		color.Cyan("Body: %s", color.HiBlackString(getValueOrEmpty(request.Body)))
 		color.Yellow("=== End of Request ID: %s ===\n", request.RequestID)
 	} else {
 		// Log in one line
 		color.Yellow("[INCOMING] %s%s %s%s %s%s %s%s",
-			color.HiBlackString("timestamp="), getValueOrEmpty(request.Timestamp),
-			color.HiBlackString("ip="), getValueOrEmpty(request.IP),
-			color.HiBlackString("method="), getValueOrEmpty(request.Method),
+			color.HiBlackString("ip="), getValueOrEmpty(request.Request.IP),
+			color.HiBlackString("method="), getValueOrEmpty(request.Request.Method),
 			color.HiBlackString("request_id="), getValueOrEmpty(request.RequestID),
 		)
 	}
@@ -136,20 +161,26 @@ func prettyJSON(v interface{}) string {
 // forwardRequest forwards the webhook request to the specified URL
 func forwardRequest(request WebhookRequest, forwardTo string) {
 	client := &http.Client{}
-
 	reqURL := forwardTo
-	if request.Query != "" {
-		reqURL += "?" + request.Query
+
+	if len(request.Request.Query) > 0 {
+		values := url.Values{}
+		for k, v := range request.Request.Query {
+			values.Add(k, v)
+		}
+		reqURL += "?" + values.Encode()
 	}
 
-	req, err := http.NewRequest(request.Method, reqURL, strings.NewReader(request.Body))
+	
+
+	req, err := http.NewRequest(request.Request.Method, reqURL, request.Request.Body)
 	if err != nil {
 		color.Red("Error creating forward request: %v", err)
 		return
 	}
 
 	// Set headers
-	for k, v := range request.Headers {
+	for k, v := range request.Request.Headers {
 		req.Header.Set(k, v)
 	}
 
@@ -178,10 +209,39 @@ func forwardRequest(request WebhookRequest, forwardTo string) {
 		color.Red("Error forwarding request to %s: %v", reqURL, err)
 		return
 	}
-	defer resp.Body.Close()
 
 	duration := time.Since(start)
 	color.Blue("[FORWARDED] %s%d %s%dms %s%s", color.HiBlackString("status="), resp.StatusCode, color.HiBlackString("time="), duration.Milliseconds(), color.HiBlackString("destination="), reqURL)
+
+	forwardResponse(resp, request.RequestID)
+}
+
+// forwardResponse fowards the response from a webhook request that was fowarded to another URL back to the api
+func forwardResponse(response *http.Response, requestID string) {
+	defer response.Body.Close()
+
+	bodyBytes, err := io.ReadAll(response.Body)
+	if err != nil {
+		color.Red("Error reading response body: %v", err)
+		return
+	}
+	webhookURL := APIURL + "responses/" + requestID
+	resp, err := http.Post(webhookURL, "application/json", bytes.NewReader(bodyBytes))
+
+	if err != nil {
+		return
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		err := fmt.Errorf("unable to forward webhook callback response (status code %d)", resp.StatusCode)
+		color.Red("Error forwarding webhook request response: %v", err)
+		return
+	}
+
+	color.Green("Forwarded webhook request response successfully: %v", response.Body, resp.Body, resp.StatusCode)
+
+	defer resp.Body.Close()
+
 }
 
 // decodeBase64Body decodes a Base64 encoded body and extracts the original content-type
@@ -218,6 +278,7 @@ func pollWebhook(config AppConfig) {
 		for _, request := range webhookData.Requests {
 			logRequest(request, config.FullLog)
 			if config.ForwardTo != "" {
+				color.Yellow("[FORWARDING REQUEST]")
 				forwardRequest(request, config.ForwardTo)
 			}
 		}
@@ -356,15 +417,17 @@ func runRootCommand(cmd *cobra.Command, args []string, appConfig *AppConfig) {
 		}
 	} else {
 		// If a webhook ID or URL is provided, extract the webhook ID and optionally the request ID
-		webhookID, requestID, err := extractIdsFromURLOrArgs(args[0])
-		if err != nil {
-			color.Red("Error parsing webhook URL: %v", err)
-			os.Exit(1)
-		}
+		// webhookID, requestID, err := extractIdsFromURLOrArgs(args[0])
+
+		webhookID := args[0]
+		// if err != nil {
+		// 	color.Red("Error parsing webhook URL: %v", err)
+		// 	os.Exit(1)
+		// }
 		appConfig.WebhookID = webhookID
-		if requestID != "" {
-			appConfig.RequestID = requestID
-		}
+		// if requestID != "" {
+		// 	appConfig.RequestID = requestID
+		// }
 	}
 
 	// Update config
