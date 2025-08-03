@@ -25,8 +25,8 @@ import (
 var (
 	// Version is set during release
 	Version          = "dev"
-	APIURL           = "http://localhost:8911/api/"
-	BaseURL          = "http://localhost:8911"
+	APIURL           = "https://banture.speedballmag.com/api/"
+	BaseURL          = "https://banture.speedballmag.com"
 	SettingsFilename = ".usewebhook"
 )
 
@@ -171,9 +171,19 @@ func forwardRequest(request WebhookRequest, forwardTo string) {
 		reqURL += "?" + values.Encode()
 	}
 
-	
+	var bodyReader io.Reader
+	if len(request.Request.Body) > 0 {
+		bodyBytes, err := json.Marshal(request.Request.Body)
+		if err != nil {
+			color.Red("Error marshaling request body: %v", err)
+			return
+		}
+		bodyReader = bytes.NewReader(bodyBytes)
+	} else {
+		bodyReader = nil
+	}
 
-	req, err := http.NewRequest(request.Request.Method, reqURL, request.Request.Body)
+	req, err := http.NewRequest(request.Request.Method, reqURL, bodyReader)
 	if err != nil {
 		color.Red("Error creating forward request: %v", err)
 		return
@@ -226,7 +236,24 @@ func forwardResponse(response *http.Response, requestID string) {
 		return
 	}
 	webhookURL := APIURL + "responses/" + requestID
-	resp, err := http.Post(webhookURL, "application/json", bytes.NewReader(bodyBytes))
+
+	var jsonBody []byte
+
+	var temp map[string]any
+	if err := json.Unmarshal(bodyBytes, &temp); err == nil {
+
+		jsonBody = bodyBytes
+	} else {
+
+		jsonBody, err = json.Marshal(map[string]any{
+			"body": string(bodyBytes),
+		})
+		if err != nil {
+			color.Red("Error marshaling response body: %v", err)
+			return
+		}
+	}
+	resp, err := http.Post(webhookURL, "application/json", bytes.NewReader(jsonBody))
 
 	if err != nil {
 		return
